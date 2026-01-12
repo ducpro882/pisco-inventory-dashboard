@@ -23,6 +23,7 @@ KHÔNG chạy bên trong Streamlit
 from __future__ import annotations
 
 import os
+import time
 import sys
 import json
 import sqlite3
@@ -36,14 +37,17 @@ import pandas as pd
 from detect_total_row import split_total_row
 
 # ===================== CONFIG =====================
-EXPORT_DIR = Path(os.getenv("INVENTORY_EXPORT_DIR", "exports"))
+BASE_DIR = Path(__file__).resolve().parent
+EXPORT_DIR = BASE_DIR / "exports"
 EXPORT_DIR.mkdir(exist_ok=True)
 
 INPUT_XLSX = Path(os.getenv("INVENTORY_INPUT_XLSX", EXPORT_DIR / "inventory_latest.xlsx"))
 PARQUET_LATEST = EXPORT_DIR / "inventory_latest.parquet"
-LOG_FILE = EXPORT_DIR / "update_status.log"
+LOCK_FILE = EXPORT_DIR / "update.lock"
+STATUS_FILE = EXPORT_DIR / "update_status.json"
 DB_PATH = Path(os.getenv("INVENTORY_DB", "pisco_inventory.db"))
 CRAWLER_PATH = os.getenv("INVENTORY_CRAWLER", "").strip()
+LOG_FILE = EXPORT_DIR / "update.log"
 
 QTY_COLS = [
     "total_qty",
@@ -64,6 +68,47 @@ SAFE_COLS = [
 ]
 
 # ===================== DB =====================
+def write_status(state: str, message: str = "", progress: int | None = None):
+    payload = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "state": state,         # "idle" | "running" | "ok" | "error"
+        "message": message,
+        "progress": progress
+    }
+    try:
+        STATUS_FILE.write_text(__import__("json").dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def acquire_lock(ttl_seconds: int = 60 * 30) -> bool:
+    """
+    Trả True nếu lấy được lock.
+    Nếu lock tồn tại quá TTL -> coi như lock chết, tự giải phóng.
+    """
+    try:
+        if LOCK_FILE.exists():
+            age = time.time() - LOCK_FILE.stat().st_mtime
+            if age < ttl_seconds:
+                return False
+            # lock quá cũ -> giải phóng
+            try:
+                LOCK_FILE.unlink()
+            except Exception:
+                return False
+
+        LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+def release_lock():
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+
+
 def ensure_db(conn: sqlite3.Connection):
     conn.execute("""
     CREATE TABLE IF NOT EXISTS inventory_snapshot (
@@ -167,112 +212,135 @@ def run_pis2_crawler():
 
 # ===================== MAIN =====================
 def main():
-    # 1. Run crawler (optional)
-    run_crawler_if_any()
+    # 0. Check ENV (Render)
+    required = ["ECOMPANY", "EID", "EPASS"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        write_status("error", f"Missing env vars: {missing}")
+        raise RuntimeError(f"Missing env vars: {missing}")
 
-    run_pis2_crawler()
+    # 1. Acquire lock
+    if not acquire_lock():
+        write_status("running", "Another update is already running")
+        return
 
-    # 2. kiểm tra lại Excel
-    if not INPUT_XLSX.exists():
-        raise FileNotFoundError(f"pis2 không tạo ra file: {INPUT_XLSX}")
+    write_status("running", "Update started", progress=0)
+    log("UPDATE STARTED")
 
-    # 3. đọc dữ liệu
-    raw = pd.read_excel(INPUT_XLSX)
-
-    # 2. Read + normalize
-    raw = pd.read_excel(INPUT_XLSX)
-    raw = normalize(raw)
-
-    # 3. Detect total row + audit
-    clean_df, total_row, meta = split_total_row(
-        raw,
-        qty_cols=QTY_COLS,
-        code_col="product_code",
-        name_col="product_name",
-        spec_col="spec",
-        tolerance=0,
-        min_confidence=0.80,
-        last_k_rows=8,
-    )
-
-    # 4. Snapshot identity
-    snapshot_at = datetime.now().isoformat(timespec="seconds")
-    snapshot_id = datetime.now().strftime("%Y%m%d%H%M%S")
-
-    # 5. Write Parquet (latest)
-    clean_df.to_parquet(PARQUET_LATEST, index=False)
-
-    # 6. Write DB (snapshot + audit)
-    conn = sqlite3.connect(DB_PATH)
     try:
-        ensure_db(conn)
+        # 2. Run crawler (optional)
+        write_status("running", "Running crawler", progress=10)
+        run_crawler_if_any()
 
-        total_clean = int(clean_df["total_qty"].sum())
-        row_count = int(len(clean_df))
-        created_at = datetime.now().isoformat(timespec="seconds")
+        write_status("running", "Running pis2 crawler", progress=20)
+        run_pis2_crawler()
 
-        # xác định status
-        if not meta["found"]:
-            status = "SUCCESS"
-        elif meta["confidence"] >= 0.9:
-            status = "SUCCESS"
-        elif meta["confidence"] >= 0.8:
-            status = "WARNING"
-        else:
-            status = "FAILED"
+        # 3. Check Excel
+        if not INPUT_XLSX.exists():
+            raise FileNotFoundError(f"pis2 không tạo ra file: {INPUT_XLSX}")
 
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO inventory_snapshot
-            (snapshot_id, snapshot_at, row_count, total_qty, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                snapshot_id,
-                snapshot_at,
-                len(clean_df),
-                int(clean_df["total_qty"].sum()),
-                status,
-                datetime.now().isoformat(timespec="seconds"),
+        # 4. Read + normalize
+        write_status("running", "Reading & normalizing data", progress=40)
+        raw = pd.read_excel(INPUT_XLSX)
+        raw = normalize(raw)
+
+        # 5. Detect total row
+        write_status("running", "Detecting total row", progress=60)
+        clean_df, total_row, meta = split_total_row(
+            raw,
+            qty_cols=QTY_COLS,
+            code_col="product_code",
+            name_col="product_name",
+            spec_col="spec",
+            tolerance=0,
+            min_confidence=0.80,
+            last_k_rows=8,
+        )
+
+        # 6. Snapshot identity
+        snapshot_at = datetime.now().isoformat(timespec="seconds")
+        snapshot_id = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        # 7. Write Parquet
+        write_status("running", "Writing parquet", progress=80)
+        clean_df.to_parquet(PARQUET_LATEST, index=False)
+
+        # 8. Write DB
+        write_status("running", "Writing database", progress=90)
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            ensure_db(conn)
+
+            total_clean = int(clean_df["total_qty"].sum())
+            created_at = datetime.now().isoformat(timespec="seconds")
+
+            if not meta["found"]:
+                status = "SUCCESS"
+            elif meta["confidence"] >= 0.9:
+                status = "SUCCESS"
+            elif meta["confidence"] >= 0.8:
+                status = "WARNING"
+            else:
+                status = "FAILED"
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO inventory_snapshot
+                (snapshot_id, snapshot_at, row_count, total_qty, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    snapshot_at,
+                    len(clean_df),
+                    total_clean,
+                    status,
+                    created_at,
+                )
             )
-        )
 
+            conn.execute("DELETE FROM inventory_data WHERE snapshot_id = ?", (snapshot_id,))
+            clean_df.assign(snapshot_id=snapshot_id, snapshot_at=snapshot_at).to_sql(
+                "inventory_data",
+                conn,
+                if_exists="append",
+                index=False,
+            )
 
-        conn.execute("DELETE FROM inventory_data WHERE snapshot_id = ?", (snapshot_id,))
+            conn.execute(
+                """
+                INSERT INTO detect_total_audit (
+                    snapshot_id, detected_at, found,
+                    confidence, score, row_index, reasons,
+                    total_qty_excel, total_qty_clean
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    snapshot_id,
+                    created_at,
+                    int(meta["found"]),
+                    meta["confidence"],
+                    meta["score"],
+                    meta["row_index"],
+                    json.dumps(meta["reasons"], ensure_ascii=False),
+                    int(total_row["total_qty"]) if total_row is not None else None,
+                    total_clean,
+                ),
+            )
 
-        clean_df.assign(snapshot_id=snapshot_id, snapshot_at=snapshot_at).to_sql(
-            "inventory_data",
-            conn,
-            if_exists="append",
-            index=False,
-        )
+            conn.commit()
+        finally:
+            conn.close()
 
-        conn.execute(
-            """
-            INSERT INTO detect_total_audit (
-                snapshot_id, detected_at, found,
-                confidence, score, row_index, reasons,
-                total_qty_excel, total_qty_clean
-            ) VALUES (?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                snapshot_id,
-                created_at,
-                int(meta["found"]),
-                meta["confidence"],
-                meta["score"],
-                meta["row_index"],
-                json.dumps(meta["reasons"], ensure_ascii=False),
-                int(total_row["total_qty"]) if total_row is not None else None,
-                total_clean,
-            ),
-        )
+        write_status("ok", "Update finished", progress=100)
+        log(f"UPDATE FINISHED | snapshot={snapshot_id}")
 
-        conn.commit()
+    except Exception as e:
+        write_status("error", f"Update failed: {e}")
+        log(f"UPDATE FAILED: {e}")
+        raise
     finally:
-        conn.close()
-
-    print("OK – Inventory updated | snapshot:", snapshot_id)
+        release_lock()
 
     
 
