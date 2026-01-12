@@ -3,8 +3,11 @@ services:
     name: pisco-inventory-dashboard
     env: python
     plan: free
+
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app_vn_exec_detect_total.py
+
+    startCommand: streamlit run pis1.py --server.port $PORT --server.address 0.0.0.0
+
     disk:
       name: data
       mountPath: /data
