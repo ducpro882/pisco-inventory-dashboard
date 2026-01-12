@@ -20,7 +20,7 @@ Ghi chú:
 """
 
 from __future__ import annotations
-
+import json
 import re
 import time
 import sys
@@ -89,9 +89,10 @@ EXPORT_DIR.mkdir(exist_ok=True)
 DB_PATH = BASE_DIR / "pisco_inventory.db"
 PARQUET_LATEST = EXPORT_DIR / "inventory_latest.parquet"
 
-LOG_FILE = EXPORT_DIR / "update_status.log"
+STATUS_FILE = EXPORT_DIR / "update_status.json"
+
 UPDATE_JOB = BASE_DIR / "update_inventory_v2.py"
-ALLOW_RUN_UPDATE_JOB = True  # False nếu chỉ muốn reload cache (không chạy crawler)
+ # False nếu chỉ muốn reload cache (không chạy crawler)
 
 # UX mode (giữ đơn giản, có thể mở rộng thêm)
 UX_MODE = "EXECUTIVE"  # EXECUTIVE | ANALYST
@@ -233,15 +234,7 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     out["_snapshot_at_dt"] = pd.to_datetime(out["snapshot_at"], errors="coerce")
     return out
 
-def read_log_tail(max_lines: int = 80) -> str:
-    if not LOG_FILE.exists():
-        return ""
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        return "".join(lines[-max_lines:])
-    except Exception:
-        return ""
+
 
 def db_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     q = "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
@@ -407,7 +400,13 @@ def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
             df.to_excel(writer, index=False, sheet_name=name[:31])
     return buf.getvalue()
 
-
+def read_update_status() -> dict | None:
+    if not STATUS_FILE.exists():
+        return None
+    try:
+        return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 # ===================== SMART SEARCH (CORE) =====================
 def prepare_search_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -570,50 +569,47 @@ def render_sku_summary_card(row: pd.Series, rename_map: dict) -> None:
 st.title("📊 Dashboard PISCO – Executive")
 
 col_u1, col_u2 = st.columns([1, 4])
+
 with col_u1:
     if st.button("🔄 Cập nhật dữ liệu", use_container_width=True):
         if not UPDATE_JOB.exists():
             st.error(f"Không tìm thấy file job: {UPDATE_JOB}")
             st.stop()
 
-        if LOG_FILE.exists():
-            try:
-                LOG_FILE.unlink()
-            except Exception:
-                pass
-
-        st.info("✅ Đang cập nhật. Vui lòng chờ hoàn tất…")
-        progress = st.progress(0)
-        log_box = st.empty()
-
-        if ALLOW_RUN_UPDATE_JOB:
-            proc = subprocess.Popen(
-                [sys.executable, str(UPDATE_JOB)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            step = 0
-            start = time.time()
-
-            while proc.poll() is None:
-                time.sleep(0.5)
-                step = min(step + 1, 95)
-                progress.progress(step)
-                log_box.markdown("```\n" + read_log_tail() + "\n```")
-
-            progress.progress(100)
-            duration = time.time() - start
-            log_box.markdown("```\n" + read_log_tail() + "\n```")
-
-            if proc.returncode == 0:
-                st.success(f"🎉 Cập nhật thành công ({duration:.1f}s). Dashboard sẽ reload dữ liệu mới.")
-            else:
-                st.error("❌ Job cập nhật thất bại. Vui lòng xem log phía trên.")
-        else:
-            st.cache_data.clear()
-            st.info("Chế độ reload: không chạy job, chỉ reload dữ liệu hiện có.")
-
+        # chạy job nền, KHÔNG BLOCK UI
+        subprocess.Popen(
+            [sys.executable, str(UPDATE_JOB)],
+            cwd=str(BASE_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        st.success("✅ Đã gửi lệnh cập nhật. Job đang chạy nền…")
         st.rerun()
+
+# ===== REALTIME STATUS (POLLING) =====
+status = read_update_status()
+
+if status:
+    state = status.get("state")
+    msg = status.get("message", "")
+    prog = status.get("progress")
+    ts = status.get("ts", "")
+
+    with col_u2:
+        st.caption(f"🕒 Trạng thái lúc {ts}")
+        if prog is not None:
+            st.progress(int(prog))
+
+        if state == "running":
+            st.info(f"⏳ Đang cập nhật: {msg}")
+            time.sleep(20)
+            st.rerun()
+        elif state == "ok":
+            st.success(f"✅ Hoàn tất: {msg}")
+        elif state == "error":
+            st.error(f"❌ Lỗi: {msg}")
+
+    
 
 # ===================== SIDEBAR NAV =====================
 if "meeting_mode" not in st.session_state:
@@ -669,8 +665,7 @@ else:
     # Meeting mode defaults
     page = "🔍 Tra cứu tồn kho chi tiết"
     qty_col = "total_qty"
-    filter_positive_only = True
-    min_qty = 0
+    
 
 # ===== DEFAULT FILTER VALUES (ALWAYS DEFINED) =====
 filter_positive_only = True
