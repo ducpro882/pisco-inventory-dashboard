@@ -570,24 +570,62 @@ st.title("📊 Dashboard PISCO – Executive")
 
 col_u1, col_u2 = st.columns([1, 4])
 
-with col_u1:
-    if st.button("🔄 Cập nhật dữ liệu", use_container_width=True):
-        if not UPDATE_JOB.exists():
-            st.error(f"Không tìm thấy file job: {UPDATE_JOB}")
-            st.stop()
+if "is_updating" not in st.session_state:
+    st.session_state["is_updating"] = False
 
-        # chạy job nền, KHÔNG BLOCK UI
+with col_u1:
+    clicked = st.button(
+        "⏳ Đang cập nhật..." if st.session_state["is_updating"] else "🔄 Cập nhật dữ liệu",
+        use_container_width=True,
+        disabled=st.session_state["is_updating"]
+    )
+
+    if clicked:
+        st.session_state["is_updating"] = True
+
+        # ghi trạng thái ngay để tránh click 2 lần
+        STATUS_FILE.write_text(
+            json.dumps({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "state": "running",
+                "message": "Khởi động job cập nhật",
+                "progress": 0
+            }),
+            encoding="utf-8"
+        )
+
         subprocess.Popen(
             [sys.executable, str(UPDATE_JOB)],
             cwd=str(BASE_DIR),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        st.success("✅ Đã gửi lệnh cập nhật. Job đang chạy nền…")
+
         st.rerun()
 
 # ===== REALTIME STATUS (POLLING) =====
 status = read_update_status()
+
+# ===================== GLOBAL UPDATE GUARD =====================
+if status and status.get("state") == "running":
+    st.markdown("---")
+    st.subheader("⏳ Hệ thống đang cập nhật dữ liệu")
+    st.info(
+        "Quá trình cập nhật đang chạy ở nền.\n\n"
+        "🔒 Toàn bộ chức năng tạm thời bị khóa để đảm bảo dữ liệu nhất quán.\n\n"
+        "Vui lòng chờ trong giây lát…"
+    )
+
+    prog = status.get("progress")
+    if prog is not None:
+        st.progress(int(prog))
+
+    # Khoảng đệm UX
+    st.caption("⏱ Trang sẽ tự động cập nhật khi hoàn tất")
+
+    time.sleep(20)
+    st.rerun()
+
 
 if status:
     state = status.get("state")
@@ -595,20 +633,49 @@ if status:
     prog = status.get("progress")
     ts = status.get("ts", "")
 
+    from datetime import datetime
+
     with col_u2:
-        st.caption(f"🕒 Trạng thái lúc {ts}")
+        try:
+            dt = datetime.fromisoformat(ts)
+            st.caption("🕒 **Cập nhật lần cuối**")
+            st.markdown(
+                f"""
+                - **Ngày:** {dt.strftime('%d/%m/%Y')}
+                - **Giờ:** {dt.strftime('%H:%M:%S')}
+                """)
+        except Exception:
+            st.caption(f"🕒 Trạng thái lúc {ts}")
         if prog is not None:
             st.progress(int(prog))
 
         if state == "running":
             st.info(f"⏳ Đang cập nhật: {msg}")
+            if prog is not None:
+                st.progress(int(prog))
             time.sleep(20)
             st.rerun()
+
         elif state == "ok":
             st.success(f"✅ Hoàn tất: {msg}")
+            time.sleep(2)
+            try:
+                STATUS_FILE.unlink()
+            except Exception:
+                pass
+            st.session_state["is_updating"] = False
+            st.rerun()
+
         elif state == "error":
             st.error(f"❌ Lỗi: {msg}")
+            try:
+                STATUS_FILE.unlink()
+            except Exception:
+                pass
+            st.session_state["is_updating"] = False
 
+
+       
     
 
 # ===================== SIDEBAR NAV =====================

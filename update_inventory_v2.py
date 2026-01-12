@@ -122,6 +122,24 @@ def ensure_db(conn: sqlite3.Connection):
     """)
 
     conn.execute("""
+    CREATE TABLE IF NOT EXISTS detect_total_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_id TEXT,
+        detected_at TEXT,
+        found INTEGER,
+        confidence REAL,
+        score REAL,
+        row_index INTEGER,
+        reasons TEXT,
+        total_qty_excel INTEGER,
+        total_qty_clean INTEGER
+    )
+    """)
+
+    # MIGRATION: nếu inventory_data có cột id (schema cũ) -> rebuild
+    migrate_inventory_data_if_needed(conn)
+
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS inventory_data (
         snapshot_id TEXT,
         snapshot_at TEXT,
@@ -144,23 +162,70 @@ def ensure_db(conn: sqlite3.Connection):
     )
     """)
 
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_data_snapshot ON inventory_data(snapshot_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_snapshot ON detect_total_audit(snapshot_id)")
+
+def migrate_inventory_data_if_needed(conn: sqlite3.Connection):
+    """
+    Nếu inventory_data đang có cột 'id' (schema cũ) -> rebuild lại table.
+    """
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='inventory_data'")
+    if not cur.fetchone():
+        return  # chưa có table -> không cần migrate
+
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(inventory_data)").fetchall()]  # r[1] = column name
+    if "id" not in cols:
+        return  # schema ok
+
+    # Rebuild table
+    conn.execute("ALTER TABLE inventory_data RENAME TO inventory_data_old")
+
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS detect_total_audit (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+    CREATE TABLE inventory_data (
         snapshot_id TEXT,
-        detected_at TEXT,
-        found INTEGER,
-        confidence REAL,
-        score REAL,
-        row_index INTEGER,
-        reasons TEXT,
-        total_qty_excel INTEGER,
-        total_qty_clean INTEGER
+        snapshot_at TEXT,
+        product_code TEXT,
+        product_name TEXT,
+        spec TEXT,
+        total_qty INTEGER,
+        total_safe_qty INTEGER,
+        shortage_qty INTEGER,
+        mindman_qty INTEGER,
+        mindman_safe_qty INTEGER,
+        pisco_jp_qty INTEGER,
+        pisco_jp_safe_qty INTEGER,
+        pisco_kr_qty INTEGER,
+        pisco_kr_safe_qty INTEGER,
+        pisco_tw_qty INTEGER,
+        pisco_tw_safe_qty INTEGER,
+        totra_qty INTEGER,
+        totra_safe_qty INTEGER
     )
     """)
 
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_data_snapshot ON inventory_data(snapshot_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_snapshot ON detect_total_audit(snapshot_id)")
+    # Copy dữ liệu cũ sang (bỏ id)
+    common = [
+        "snapshot_id","snapshot_at","product_code","product_name","spec",
+        "total_qty","total_safe_qty","shortage_qty",
+        "mindman_qty","mindman_safe_qty",
+        "pisco_jp_qty","pisco_jp_safe_qty",
+        "pisco_kr_qty","pisco_kr_safe_qty",
+        "pisco_tw_qty","pisco_tw_safe_qty",
+        "totra_qty","totra_safe_qty"
+    ]
+
+    # Chỉ copy những cột thực sự tồn tại trong table cũ
+    old_cols = set(cols)
+    use_cols = [c for c in common if c in old_cols]
+
+    conn.execute(
+        f"INSERT INTO inventory_data ({','.join(use_cols)}) "
+        f"SELECT {','.join(use_cols)} FROM inventory_data_old"
+    )
+
+    conn.execute("DROP TABLE inventory_data_old")
+    conn.commit()
+
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -212,6 +277,8 @@ def run_pis2_crawler():
 
 # ===================== MAIN =====================
 def main():
+    print("DB_PATH =", DB_PATH.resolve())
+
     # 0. Check ENV (Render)
     required = ["ECOMPANY", "EID", "EPASS"]
     missing = [k for k in required if not os.getenv(k)]
@@ -300,12 +367,31 @@ def main():
             )
 
             conn.execute("DELETE FROM inventory_data WHERE snapshot_id = ?", (snapshot_id,))
-            clean_df.assign(snapshot_id=snapshot_id, snapshot_at=snapshot_at).to_sql(
+            # ===== ENSURE SCHEMA MATCH (DROP COLUMNS NOT IN DB) =====
+            allowed_cols = [
+                "snapshot_id", "snapshot_at",
+                "product_code", "product_name", "spec",
+                "total_qty", "total_safe_qty", "shortage_qty",
+                "mindman_qty", "mindman_safe_qty",
+                "pisco_jp_qty", "pisco_jp_safe_qty",
+                "pisco_kr_qty", "pisco_kr_safe_qty",
+                "pisco_tw_qty", "pisco_tw_safe_qty",
+                "totra_qty", "totra_safe_qty",
+            ]
+
+            df_to_db = (
+                clean_df
+                .assign(snapshot_id=snapshot_id, snapshot_at=snapshot_at)
+                .loc[:, lambda d: [c for c in allowed_cols if c in d.columns]]
+            )
+            print("DF columns =", list(clean_df.columns))
+            df_to_db.to_sql(
                 "inventory_data",
                 conn,
                 if_exists="append",
                 index=False,
             )
+
 
             conn.execute(
                 """
