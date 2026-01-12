@@ -1,7 +1,16 @@
 services:
   - type: web
-    name: pisco-dashboard
+    name: pisco-inventory-dashboard
     env: python
+    plan: free
+
     pythonVersion: 3.11.9
-    buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run pis1.py --server.port $PORT --server.address 0.0.0.0
+
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+
+    startCommand: |
+      streamlit run pis1.py --server.port=$PORT --server.address=0.0.0.0
+
+    autoDeploy: true
