@@ -83,10 +83,10 @@ div[data-testid="stMarkdown"] .kpi-tile .value {
 
 
 BASE_DIR = Path(__file__).resolve().parent
-EXPORT_DIR = BASE_DIR / "exports"
+EXPORT_DIR = Path("/data/exports")
 EXPORT_DIR.mkdir(exist_ok=True)
 
-DB_PATH = BASE_DIR / "pisco_inventory.db"
+DB_PATH = Path("/data/pisco_inventory.db")
 PARQUET_LATEST = EXPORT_DIR / "inventory_latest.parquet"
 
 STATUS_FILE = EXPORT_DIR / "update_status.json"
