@@ -38,14 +38,14 @@ from detect_total_row import split_total_row
 
 # ===================== CONFIG =====================
 BASE_DIR = Path(__file__).resolve().parent
-EXPORT_DIR = BASE_DIR / "exports"
+EXPORT_DIR = Path("/data/exports")
 EXPORT_DIR.mkdir(exist_ok=True)
 
 INPUT_XLSX = Path(os.getenv("INVENTORY_INPUT_XLSX", EXPORT_DIR / "inventory_latest.xlsx"))
 PARQUET_LATEST = EXPORT_DIR / "inventory_latest.parquet"
 LOCK_FILE = EXPORT_DIR / "update.lock"
 STATUS_FILE = EXPORT_DIR / "update_status.json"
-DB_PATH = Path(os.getenv("INVENTORY_DB", "pisco_inventory.db"))
+DB_PATH = Path("/data/pisco_inventory.db")
 CRAWLER_PATH = os.getenv("INVENTORY_CRAWLER", "").strip()
 LOG_FILE = EXPORT_DIR / "update.log"
 
