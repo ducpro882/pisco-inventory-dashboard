@@ -2,9 +2,6 @@ services:
   - type: web
     name: pisco-dashboard
     env: python
-    plan: free
+    pythonVersion: 3.11.9
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run pis1.py --server.port=$PORT --server.address=0.0.0.0
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.8
+    startCommand: streamlit run pis1.py --server.port $PORT --server.address 0.0.0.0
