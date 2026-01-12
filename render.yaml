@@ -4,4 +4,8 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: bash start.sh
+    startCommand: streamlit run app_vn_exec_detect_total.py
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
